@@ -1,3 +1,8 @@
+'''
+From Chat: https://chatgpt.com/g/g-p-69984a12b5d881919bb92094f885a880/c/69984a2e-1d00-8390-8dd9-9dcdaae87dd0
+Search "Example of a production-quality version."
+''' 
+
 #!/bin/bash
 
 # Backfill ENTSO-E generation data
