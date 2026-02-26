@@ -1,0 +1,39 @@
+{
+  "Comment": "ENTSOE backfill: Map over country-month tasks",
+  "StartAt": "BackfillMap",
+  "States": {
+    "BackfillMap": {
+      "Type": "Map",
+      "ItemsPath": "$.tasks",
+      "MaxConcurrency": 5,
+      "Iterator": {
+        "StartAt": "InvokeBackfillWorker",
+        "States": {
+          "InvokeBackfillWorker": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "entsoe-backfill-worker",
+              "Payload.$": "$"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 3,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "End": true
+          }
+        }
+      },
+      "End": true
+    }
+  }
+}

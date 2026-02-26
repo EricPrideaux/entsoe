@@ -1,0 +1,36 @@
+{
+  "Comment": "Parallel ENTSOE country fetch",
+  "StartAt": "ProcessCountries",
+  "States": {
+    "ProcessCountries": {
+      "Type": "Map",
+      "ItemsPath": "$.countries",
+      "MaxConcurrency": 5,
+      "Iterator": {
+        "StartAt": "InvokeWorker",
+        "States": {
+          "InvokeWorker": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "entsoe-worker",
+              "Payload": {
+                "country.$": "$"
+              }
+            },
+            "Retry": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "End": true
+          }
+        }
+      },
+      "End": true
+    }
+  }
+}

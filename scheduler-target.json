@@ -1,0 +1,5 @@
+{
+  "Arn": "arn:aws:states:eu-west-2:801886451424:stateMachine:entsoe-country-orchestrator",
+  "RoleArn": "arn:aws:iam::801886451424:role/scheduler-step-role",
+  "Input": "{\"countries\":[\"DE\",\"AT\"]}"
+}
