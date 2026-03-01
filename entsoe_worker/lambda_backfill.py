@@ -1,20 +1,25 @@
 '''
-Chat: https://chatgpt.com/g/g-p-69984a12b5d881919bb92094f885a880/c/69984a2e-1d00-8390-8dd9-9dcdaae87dd0
+ENTSO-E Historical Backfill Lambda (User-Defined Date Range)
 
-• One file per country-month
-• Fully Glue/Athena compatible
-• Deterministic
-• Idempotent (with OVERWRITE flag)
-• Retry-safe ENTSOE API calls
-• Handles variable month lengths
-• Analytics-ready (explicit date column)
+Purpose:
+- Backfills ENTSO-E generation data for a given country
+  between start_date and end_date (inclusive).
+- Writes one Parquet file per day.
+- Hive-compatible S3 layout:
+    entsoe/generation/
+      country=XX/
+        year=YYYY/
+          month=MM/
+            day=DD/data.parquet
+- Idempotent (skips existing unless OVERWRITE=true)
+- Retry-safe against ENTSO-E 429/5xx
+- Athena / Glue / QuickSight ready
 '''
 
 import os
 import time
 import random
-import calendar
-from datetime import date
+from datetime import datetime, timedelta, date
 
 import pandas as pd
 import boto3
@@ -28,7 +33,7 @@ s3 = boto3.client("s3")
 
 BUCKET_NAME = os.environ["BUCKET_NAME"]
 ENTSOE_API_KEY = os.environ["ENTSOE_API_KEY"]
-OVERWRITE = os.environ.get("OVERWRITE", "true").lower() == "true"
+OVERWRITE = os.environ.get("OVERWRITE", "false").lower() == "true"
 
 client = EntsoePandasClient(api_key=ENTSOE_API_KEY)
 
@@ -37,7 +42,7 @@ RETRYABLE_STATUS = {429, 502, 503, 504}
 # --------------------------
 # Retry-safe ENTSOE query
 # --------------------------
-def query_generation_with_retry(country: str, start, end, max_attempts=6):
+def query_generation_with_retry(country, start, end, max_attempts=6):
     for attempt in range(max_attempts):
         try:
             return client.query_generation(
@@ -48,13 +53,11 @@ def query_generation_with_retry(country: str, start, end, max_attempts=6):
         except HTTPError as e:
             status = getattr(e.response, "status_code", None)
             if status in RETRYABLE_STATUS:
-                sleep_time = min(60, (2 ** attempt) + random.uniform(0, 1.5))
-                time.sleep(sleep_time)
+                time.sleep(min(60, (2 ** attempt) + random.uniform(0, 1.5)))
                 continue
             raise
         except (Timeout, ConnectionError):
-            sleep_time = min(60, (2 ** attempt) + random.uniform(0, 1.5))
-            time.sleep(sleep_time)
+            time.sleep(min(60, (2 ** attempt) + random.uniform(0, 1.5)))
             continue
 
     raise RuntimeError(f"ENTSOE query failed after {max_attempts} attempts")
@@ -62,6 +65,16 @@ def query_generation_with_retry(country: str, start, end, max_attempts=6):
 # --------------------------
 # S3 helpers
 # --------------------------
+def s3_key(country: str, d: date) -> str:
+    return (
+        f"entsoe/generation/"
+        f"country={country}/"
+        f"year={d.year:04d}/"
+        f"month={d.month:02d}/"
+        f"day={d.day:02d}/"
+        f"data.parquet"
+    )
+
 def s3_exists(key: str) -> bool:
     try:
         s3.head_object(Bucket=BUCKET_NAME, Key=key)
@@ -75,111 +88,84 @@ def s3_exists(key: str) -> bool:
 def lambda_handler(event, context):
 
     country = event.get("country")
-    year = event.get("year")
-    month = event.get("month")
+    start_date_str = event.get("start_date")  # YYYY-MM-DD
+    end_date_str = event.get("end_date")      # YYYY-MM-DD
 
-    if not country or not year or not month:
-        raise ValueError("Event must include 'country', 'year', 'month'")
+    if not country or not start_date_str or not end_date_str:
+        raise ValueError(
+            "Event must include 'country', 'start_date', and 'end_date' (YYYY-MM-DD)"
+        )
 
-    year = int(year)
-    month = int(month)
+    start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+    end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
 
-    last_day = calendar.monthrange(year, month)[1]
+    if end_date >= datetime.utcnow().date():
+        raise ValueError("end_date must be <= today - 1")
 
-    all_days = []
+    if start_date > end_date:
+        raise ValueError("start_date cannot be after end_date")
+
+    current = start_date
+    successes = 0
+    skipped = 0
     failures = []
 
-    # --------------------------
-    # Loop each day of month
-    # --------------------------
-    for day_num in range(1, last_day + 1):
-        d = date(year, month, day_num)
+    while current <= end_date:
 
-        start = pd.Timestamp(d, tz="Europe/Brussels")
+        key = s3_key(country, current)
+
+        if (not OVERWRITE) and s3_exists(key):
+            skipped += 1
+            current += timedelta(days=1)
+            continue
+
+        start = pd.Timestamp(current, tz="Europe/Brussels")
         end = start + pd.Timedelta(days=1)
 
         try:
             df = query_generation_with_retry(country, start, end)
 
             if df is None or df.empty:
+                skipped += 1
+                current += timedelta(days=1)
                 continue
 
             df = df.reset_index()
 
-            # Flatten MultiIndex columns
             df.columns = [
                 " ".join(c).strip() if isinstance(c, tuple) else c
                 for c in df.columns
             ]
 
-            # Add date column explicitly for analytics
-            df["date"] = d
+            df["date"] = current
+            df["country"] = country
+            df["year"] = current.year
+            df["month"] = current.month
+            df["day"] = current.day
 
-            all_days.append(df)
+            tmp_path = "/tmp/data.parquet"
 
-            time.sleep(0.25)  # gentle pacing
+            df.to_parquet(
+                tmp_path,
+                engine="pyarrow",
+                index=False
+            )
+
+            s3.upload_file(tmp_path, BUCKET_NAME, key)
+
+            successes += 1
+            time.sleep(0.25)
 
         except Exception as e:
-            failures.append({
-                "day": str(d),
-                "error": str(e)
-            })
-            continue
+            failures.append({"day": str(current), "error": str(e)})
 
-    # --------------------------
-    # No data case
-    # --------------------------
-    if not all_days:
-        return {
-            "country": country,
-            "year": year,
-            "month": month,
-            "message": "No data returned",
-            "failed_days": failures[:50]
-        }
-
-    # --------------------------
-    # Concatenate entire month
-    # --------------------------
-    month_df = pd.concat(all_days, ignore_index=True)
-
-    # --------------------------
-    # Define S3 key (monthly partition)
-    # --------------------------
-    s3_key = (
-        f"entsoe/generation/"
-        f"country={country}/"
-        f"year={year}/"
-        f"month={month:02d}/"
-        f"data.parquet"
-    )
-
-    if (not OVERWRITE) and s3_exists(s3_key):
-        return {
-            "country": country,
-            "year": year,
-            "month": month,
-            "message": "Skipped existing monthly file",
-            "rows_available": len(month_df)
-        }
-
-    # --------------------------
-    # Write Parquet
-    # --------------------------
-    tmp_path = "/tmp/data.parquet"
-
-    month_df.to_parquet(
-        tmp_path,
-        engine="pyarrow",
-        index=False
-    )
-
-    s3.upload_file(tmp_path, BUCKET_NAME, s3_key)
+        current += timedelta(days=1)
 
     return {
         "country": country,
-        "year": year,
-        "month": month,
-        "rows_written": len(month_df),
-        "failed_days": failures[:50]
+        "start_date": str(start_date),
+        "end_date": str(end_date),
+        "days_written": successes,
+        "days_skipped": skipped,
+        "failures": failures[:50]
     }
