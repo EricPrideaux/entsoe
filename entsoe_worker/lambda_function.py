@@ -1,4 +1,22 @@
-N62 = "1VTtyH"
+'''
+Daily ENTSO-E generation ingestion Lambda.
+
+Purpose:
+- Runs once per day (typically via EventBridge schedule)
+- Pulls previous day's generation data for a given country
+- Flattens ENTSO-E multi-index columns
+- Writes analytics-ready Parquet file to S3
+- Stores data using Hive-style partitions:
+  entsoe/generation/country=XX/year=YYYY/month=MM/day=DD/data.parquet
+
+This file is compatible with:
+- AWS Glue Data Catalog
+- Athena partition repair
+- QuickSight dashboards
+- Monthly backfill architecture
+
+Idempotent: re-running overwrites the same daily partition.
+'''
 
 import os
 import pandas as pd
@@ -21,7 +39,7 @@ def lambda_handler(event, context):
         raise ValueError("Event must include 'country'")
 
     # -------------------------------------
-    # 2. Determine target date (yesterday)
+    # 2. Determine target date (yesterday UTC)
     # -------------------------------------
     target_date = datetime.utcnow() - timedelta(days=1)
 
@@ -39,7 +57,7 @@ def lambda_handler(event, context):
         end=end
     )
 
-    if df.empty:
+    if df is None or df.empty:
         return {"statusCode": 200, "body": f"No data for {country}"}
 
     df = df.reset_index()
@@ -50,12 +68,19 @@ def lambda_handler(event, context):
         for col in df.columns
     ]
 
+    # Add explicit date column (helps analytics + Glue)
+    df["date"] = target_date.date()
+    df["country"] = country
+    df["year"] = target_date.year
+    df["month"] = target_date.month
+    df["day"] = target_date.day
+
     # -------------------------------------
-    # 4. Write to S3 with partition structure
+    # 4. Write to S3 as Parquet
     # -------------------------------------
-    year  = target_date.strftime("%Y")
-    month = target_date.strftime("%m")
-    day   = target_date.strftime("%d")
+    year  = f"{target_date.year:04d}"
+    month = f"{target_date.month:02d}"
+    day   = f"{target_date.day:02d}"
 
     s3_key = (
         f"entsoe/generation/"
@@ -63,15 +88,20 @@ def lambda_handler(event, context):
         f"year={year}/"
         f"month={month}/"
         f"day={day}/"
-        f"data.csv"
+        f"data.parquet"
     )
 
-    tmp_path = "/tmp/data.csv"
-    df.to_csv(tmp_path, index=False)
+    tmp_path = "/tmp/data.parquet"
+
+    df.to_parquet(
+        tmp_path,
+        engine="pyarrow",
+        index=False
+    )
 
     s3.upload_file(tmp_path, BUCKET_NAME, s3_key)
 
     return {
         "statusCode": 200,
         "body": f"Uploaded {s3_key}"
-    }
+    }   
